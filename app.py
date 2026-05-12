@@ -1,71 +1,69 @@
 from flask import Flask, request, jsonify
 import os
+import sys
 import threading
 import requests
 import anthropic
-import gspread
-from google.oauth2.service_account import Credentials
 from datetime import datetime
 from openai import OpenAI
-import google.generativeai as genai
 import json
 
-# КЛЮЧИ из переменных окружения
-ANTHROPIC_KEY  = os.environ.get('ANTHROPIC_API_KEY')
-DEEPSEEK_KEY   = os.environ.get('DEEPSEEK_API_KEY')
-OPENAI_KEY     = os.environ.get('OPENAI_API_KEY')
-GEMINI_KEY     = os.environ.get('GEMINI_API_KEY')
-TG_TOKEN       = os.environ.get('TELEGRAM_BOT_TOKEN')
-TG_CHAT        = os.environ.get('TELEGRAM_CHAT_ID')
-SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', '1xBxae-SlDvhcxOfCuW3pb5tpeQTxd0sVCx2VRrehExY')
-GOOGLE_CREDS_JSON = os.environ.get('GOOGLE_CREDS_JSON', '')
+# КЛЮЧИ
+ANTHROPIC_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+DEEPSEEK_KEY  = os.environ.get('DEEPSEEK_API_KEY', '')
+OPENAI_KEY    = os.environ.get('OPENAI_API_KEY', '')
+TG_TOKEN      = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TG_CHAT       = os.environ.get('TELEGRAM_CHAT_ID', '')
 
-# TELEGRAM
+# Принудительный вывод
+print("=" * 50, flush=True)
+print("ЗАГРУЗКА ПЕРЕМЕННЫХ:", flush=True)
+print("ANTHROPIC: {} символов".format(len(ANTHROPIC_KEY)), flush=True)
+print("DEEPSEEK:  {} символов".format(len(DEEPSEEK_KEY)), flush=True)
+print("OPENAI:    {} символов".format(len(OPENAI_KEY)), flush=True)
+print("TG_TOKEN:  {} символов".format(len(TG_TOKEN)), flush=True)
+print("TG_CHAT:   {}".format(TG_CHAT), flush=True)
+print("=" * 50, flush=True)
+sys.stdout.flush()
+
 def send_telegram(text):
+    if not TG_TOKEN or not TG_CHAT:
+        print("❌ TG_TOKEN или TG_CHAT пустые!", flush=True)
+        return False
     try:
         url = "https://api.telegram.org/bot{}/sendMessage".format(TG_TOKEN)
-        requests.post(url, data={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML"}, timeout=10)
+        r = requests.post(url, data={
+            "chat_id": TG_CHAT,
+            "text": text,
+            "parse_mode": "HTML"
+        }, timeout=10)
+        print("📱 Telegram статус: {}".format(r.status_code), flush=True)
+        print("📱 Telegram ответ: {}".format(r.text[:200]), flush=True)
+        return r.status_code == 200
     except Exception as e:
-        print("Telegram error:", e)
+        print("❌ Telegram ошибка: {}".format(e), flush=True)
+        return False
 
-# GOOGLE SHEETS
-WS = None
-try:
-    if GOOGLE_CREDS_JSON:
-        creds_info = json.loads(GOOGLE_CREDS_JSON)
-        scopes = ['https://www.googleapis.com/auth/spreadsheets',
-                  'https://www.googleapis.com/auth/drive']
-        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key(SPREADSHEET_ID)
-        WS = sh.sheet1
-        if len(WS.get_all_values()) == 0:
-            WS.append_row([
-                "Время", "Тип", "Монета", "Цена", "SL", "TP", "R/R",
-                "Claude", "DeepSeek", "GPT", "Консенсус", "Финал"
-            ])
-        print("Google Sheets подключён")
-except Exception as e:
-    print("Sheets не подключён:", e)
-
-# AI
 def build_prompt(data):
     return (
-        "Сигнал от стратегии v13 (Mean Reversion):\n\n"
-        "Монета: {}\n"
-        "Тип: {}\n"
-        "Цена: ${}\n"
-        "Стоп: ${}\n"
-        "Тейк: ${}\n"
-        "R/R: {}\n"
-        "RSI: {}\n\n"
-        "Подтверждаешь?\n"
-        "СИГНАЛ: [BUY / SKIP]\n"
+        "BTC технический анализ.\n\n"
+        "Текущие данные:\n"
+        "- Цена: ${}\n"
+        "- RSI: {} (ниже 30 = перепродан, выше 70 = перекуплен)\n"
+        "- Стоп-лосс: ${}\n"
+        "- Тейк-профит: ${}\n"
+        "- R/R: {}\n\n"
+        "Стратегия mean reversion ищет вход когда:\n"
+        "- RSI < 35 (сильно перепродан)\n"
+        "- R/R >= 2.0\n"
+        "- Цена у нижней BB\n\n"
+        "Учитывая ВСЕ данные выше, что делать?\n"
+        "Ответь СТРОГО:\n"
+        "СИГНАЛ: BUY (если условия выполнены) или SKIP (если нет)\n"
         "ПРИЧИНА: одно предложение"
-    ).format(data.get("symbol", "BTC"), data.get("type", "LONG"),
-             data.get("price", "?"), data.get("sl", "?"),
-             data.get("tp", "?"), data.get("rr", "?"),
-             data.get("rsi", "?"))
+    ).format(data.get("price", "?"), data.get("rsi", "?"),
+             data.get("sl", "?"), data.get("tp", "?"),
+             data.get("rr", "?"))
 
 def ask_claude(p):
     try:
@@ -99,7 +97,8 @@ def extract(text):
 
 def process_signal(data):
     now = datetime.now().strftime('%d.%m %H:%M')
-    print("СИГНАЛ:", now, data)
+    print("\n" + "=" * 50, flush=True)
+    print("СИГНАЛ:", now, data, flush=True)
     
     prompt = build_prompt(data)
     
@@ -110,53 +109,39 @@ def process_signal(data):
     signals = [extract(c_resp), extract(d_resp), extract(g_resp)]
     buy_count = signals.count("BUY")
     
-    print("Claude:   {}".format(signals[0]))
-    print("DeepSeek: {}".format(signals[1]))
-    print("GPT:      {}".format(signals[2]))
-    print("BUY: {}/3".format(buy_count))
+    print("Claude:   {}".format(signals[0]), flush=True)
+    print("DeepSeek: {}".format(signals[1]), flush=True)
+    print("GPT:      {}".format(signals[2]), flush=True)
+    print("BUY: {}/3".format(buy_count), flush=True)
     
     final = "BUY" if buy_count >= 2 else "SKIP"
     consensus = "{}/3 BUY".format(buy_count)
     
-    # Sheets
-    if WS:
-        try:
-            WS.append_row([
-                now, data.get("type", "LONG"), data.get("symbol", "BTC"),
-                str(data.get("price", "")), str(data.get("sl", "")),
-                str(data.get("tp", "")), str(data.get("rr", "")),
-                signals[0], signals[1], signals[2], consensus, final
-            ])
-        except Exception as e:
-            print("Sheets error:", e)
-    
-    # Telegram
+    # ВСЕГДА отправляем в Telegram — для отладки
     if final == "BUY":
-        emoji = "🟢" if data.get("type") == "LONG" else "🔴"
-        msg = (
-            "{} <b>{} {} ПОДТВЕРЖДЁН</b>\n\n"
-            "💰 Цена: ${}\n"
-            "🛑 SL: ${}\n"
-            "🎯 TP: ${}\n"
-            "📊 R/R: {}\n"
-            "📈 RSI: {}\n\n"
-            "🤖 Консенсус: {} ✅\n"
-            "⏰ {}"
-        ).format(emoji, data.get("symbol", "BTC"), data.get("type", "LONG"),
-                 data.get("price", ""), data.get("sl", ""), data.get("tp", ""),
-                 data.get("rr", ""), data.get("rsi", ""), consensus, now)
-        send_telegram(msg)
+        emoji = "🟢"
+        title = "ПОДТВЕРЖДЁН"
     else:
-        msg = (
-            "⚠️ <b>Сигнал отклонён</b>\n"
-            "{} {} ${}\n"
-            "Консенсус: {} (нужно 2/3)\n"
-            "⏰ {}"
-        ).format(data.get("symbol", "BTC"), data.get("type", "LONG"),
-                 data.get("price", ""), consensus, now)
-        send_telegram(msg)
+        emoji = "⚠️"
+        title = "Отклонён AI"
+    
+    msg = (
+        "{} <b>{} {} {}</b>\n\n"
+        "💰 Цена: ${}\n"
+        "🛑 SL: ${}\n"
+        "🎯 TP: ${}\n"
+        "📊 R/R: {}\n"
+        "📈 RSI: {}\n\n"
+        "🤖 Консенсус: {}\n"
+        "Финал: {}\n"
+        "⏰ {}"
+    ).format(emoji, data.get("symbol", "BTC"), data.get("type", "LONG"), title,
+             data.get("price", ""), data.get("sl", ""), data.get("tp", ""),
+             data.get("rr", ""), data.get("rsi", ""), consensus, final, now)
+    
+    print("📨 Отправляю в Telegram...", flush=True)
+    send_telegram(msg)
 
-# FLASK
 app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
@@ -173,7 +158,7 @@ def webhook():
         threading.Thread(target=process_signal, args=(data,)).start()
         return jsonify({"status": "received"}), 200
     except Exception as e:
-        print("Webhook error:", e)
+        print("Webhook error:", e, flush=True)
         return jsonify({"error": str(e)}), 500
 
 @app.route("/test", methods=["GET"])
@@ -185,8 +170,18 @@ def test():
     threading.Thread(target=process_signal, args=(test_data,)).start()
     return jsonify({"status": "test fired"}), 200
 
+@app.route("/tg_test", methods=["GET"])
+def tg_test():
+    """Простой тест Telegram напрямую"""
+    result = send_telegram("🤖 Прямой тест Telegram из Railway")
+    return jsonify({
+        "telegram_sent": result,
+        "tg_token_length": len(TG_TOKEN),
+        "tg_chat_id": TG_CHAT
+    }), 200
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    print("Запуск сервера на порту", port)
+    print("Сервер запускается на порту", port, flush=True)
     send_telegram("🚀 <b>Railway сервер запущен</b>")
     app.run(host="0.0.0.0", port=port)
