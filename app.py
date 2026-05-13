@@ -248,8 +248,23 @@ def ask_gemini(signal):
         if r.status_code != 200:
             logging.error(f"Gemini HTTP {r.status_code}: {r.text[:200]}")
             return "ERROR"
-        answer = r.json()["candidates"][0]["content"]["parts"][0]["text"].upper()
-        return "BUY" if "BUY" in answer else "SKIP"
+        data = r.json()
+        # Gemini 2.5 может вернуть разные структуры
+        candidates = data.get("candidates", [])
+        if not candidates:
+            logging.error(f"Gemini нет candidates: {data}")
+            return "ERROR"
+        content = candidates[0].get("content", {})
+        parts = content.get("parts", [])
+        # Ищем текстовый part (пропускаем thought parts)
+        answer = ""
+        for part in parts:
+            if "text" in part:
+                answer = part["text"]
+        if not answer:
+            logging.error(f"Gemini нет текста: {candidates[0]}")
+            return "ERROR"
+        return "BUY" if "BUY" in answer.upper() else "SKIP"
     except Exception as e:
         logging.error(f"Gemini ошибка: {e}")
         return "ERROR"
@@ -485,7 +500,7 @@ def council_v15():
     except Exception as e:
         results["gpt"] = f"ERROR: {e}"
 
-    # Gemini
+# Gemini
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
         payload = {
@@ -494,12 +509,17 @@ def council_v15():
         }
         r = requests.post(url, json=payload, timeout=90)
         if r.status_code == 200:
-            results["gemini"] = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            data = r.json()
+            parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            answer = ""
+            for part in parts:
+                if "text" in part:
+                    answer = part["text"]
+            results["gemini"] = answer if answer else "ERROR: нет текста"
         else:
             results["gemini"] = f"ERROR HTTP {r.status_code}: {r.text[:300]}"
     except Exception as e:
         results["gemini"] = f"ERROR: {e}"
-
     # Отправить в Telegram
     for ai_name, answer in results.items():
         emoji = {"claude": "🟣", "deepseek": "🔵", "gpt": "🟢", "gemini": "🟡"}
