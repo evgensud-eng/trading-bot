@@ -16,6 +16,7 @@ logging.basicConfig(level=logging.INFO)
 ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 DEEPSEEK_API_KEY   = os.environ.get("DEEPSEEK_API_KEY", "")
 OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY", "")
+GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 SPREADSHEET_ID     = os.environ.get("SPREADSHEET_ID", "")
@@ -49,7 +50,7 @@ def ensure_header(sheet):
     except Exception as e:
         logging.error(f"Ошибка заголовка: {e}")
 
-def log_to_sheets(signal: dict, votes: dict, decision: str, buy_count: int, skip_reason: str = ""):
+def log_to_sheets(signal, votes, decision, buy_count, skip_reason=""):
     sheet = get_sheet()
     if sheet is None:
         return False
@@ -83,7 +84,6 @@ def log_to_sheets(signal: dict, votes: dict, decision: str, buy_count: int, skip
 
 # ─── ЕЖЕНЕДЕЛЬНЫЙ ОТЧЁТ ─────────────────────────────────────────────────────
 def weekly_report():
-    """Каждый понедельник 9:00 UTC — статистика за 7 дней."""
     logging.info("Генерирую еженедельный отчёт...")
     sheet = get_sheet()
     if sheet is None:
@@ -94,14 +94,11 @@ def weekly_report():
         if not all_rows:
             send_telegram("📊 Еженедельный отчёт: данных пока нет")
             return
-
         week_ago  = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         week_rows = [r for r in all_rows if str(r.get("Дата", "")) >= week_ago]
-        total     = len(week_rows)
-        buy_count = sum(1 for r in week_rows if r.get("Решение") == "BUY")
+        total      = len(week_rows)
+        buy_count  = sum(1 for r in week_rows if r.get("Решение") == "BUY")
         skip_count = total - buy_count
-
-        # Топ причины SKIP
         reason_counts = {}
         for r in week_rows:
             reason = r.get("Причина SKIP", "")
@@ -109,49 +106,44 @@ def weekly_report():
                 reason_counts[reason] = reason_counts.get(reason, 0) + 1
         top_reasons = sorted(reason_counts.items(), key=lambda x: x[1], reverse=True)[:3]
         reason_text = "\n".join([f"   • {r}: {c}x" for r, c in top_reasons]) if top_reasons else "   нет данных"
-
-        # По стратегиям
         strategies = {}
         for r in week_rows:
             s = r.get("Стратегия", "v13")
             strategies[s] = strategies.get(s, 0) + 1
-        strat_text = "\n".join([f"   {k}: {v} сигналов" for k, v in strategies.items()])
-
+        strat_text = "\n".join([f"   {k}: {v}" for k, v in strategies.items()])
         msg = (
             f"📊 <b>Еженедельный отчёт</b>\n"
             f"📅 {week_ago} → {datetime.now().strftime('%Y-%m-%d')}\n\n"
             f"📡 Всего сигналов: <b>{total}</b>\n"
-            f"🟢 BUY:  <b>{buy_count}</b>\n"
-            f"⚪ SKIP: <b>{skip_count}</b>\n\n"
+            f"🟢 BUY: <b>{buy_count}</b>  |  ⚪ SKIP: <b>{skip_count}</b>\n\n"
             f"📈 По стратегиям:\n{strat_text}\n\n"
-            f"❌ Топ причины SKIP:\n{reason_text}\n\n"
-            f"🔗 <a href='https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}'>Открыть таблицу</a>"
+            f"❌ Топ SKIP причины:\n{reason_text}\n\n"
+            f"🔗 <a href='https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}'>Таблица</a>"
         )
         send_telegram(msg)
-        logging.info("Еженедельный отчёт отправлен")
-
     except Exception as e:
         logging.error(f"Ошибка отчёта: {e}")
-        send_telegram(f"⚠️ Ошибка еженедельного отчёта: {e}")
+        send_telegram(f"⚠️ Ошибка отчёта: {e}")
 
 # ─── TELEGRAM ───────────────────────────────────────────────────────────────
-def send_telegram(message: str):
+def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    try:
-        logging.info("Отправляю в Telegram...")
-        r = requests.post(url, json=payload, timeout=10)
-        logging.info(f"Telegram статус: {r.status_code}")
-    except Exception as e:
-        logging.error(f"Telegram ошибка: {e}")
+    # Telegram ограничение — 4096 символов, разбиваем если нужно
+    chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
+    for chunk in chunks:
+        try:
+            r = requests.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": chunk,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            }, timeout=10)
+            logging.info(f"Telegram: {r.status_code}")
+        except Exception as e:
+            logging.error(f"Telegram ошибка: {e}")
 
 # ─── АНАЛИЗ ПРИЧИНЫ SKIP ────────────────────────────────────────────────────
-def analyze_skip_reason(signal: dict, votes: dict) -> str:
+def analyze_skip_reason(signal, votes):
     reasons = []
     try:
         rsi = float(signal.get("rsi", 50))
@@ -160,7 +152,7 @@ def analyze_skip_reason(signal: dict, votes: dict) -> str:
             reasons.append(f"RSI высокий ({rsi:.1f})")
         if rr < 1.5:
             reasons.append(f"R/R низкий ({rr:.1f})")
-        skippers = [ai for ai, vote in votes.items() if vote == "SKIP"]
+        skippers = [ai for ai, v in votes.items() if v == "SKIP"]
         if len(skippers) == 3:
             reasons.append("все AI против")
         elif skippers:
@@ -169,8 +161,8 @@ def analyze_skip_reason(signal: dict, votes: dict) -> str:
         reasons.append("условия не выполнены")
     return " | ".join(reasons) if reasons else "консилиум отклонил"
 
-# ─── AI КОНСИЛИУМ ───────────────────────────────────────────────────────────
-def build_prompt(signal: dict) -> str:
+# ─── AI ФУНКЦИИ (ТОРГОВЛЯ — 3 модели) ────────────────────────────────────────
+def build_prompt(signal):
     return f"""You are a crypto trading risk manager. Analyze this BTC trading signal and respond with ONLY one word: BUY or SKIP.
 
 Signal:
@@ -186,7 +178,7 @@ Signal:
 Rules: BUY only if R/R >= 1.5 and RSI < 45 and signal is LONG. Otherwise SKIP.
 Answer with one word only: BUY or SKIP"""
 
-def ask_claude(signal: dict) -> str:
+def ask_claude(signal):
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         msg = client.messages.create(
@@ -196,10 +188,10 @@ def ask_claude(signal: dict) -> str:
         )
         return "BUY" if "BUY" in msg.content[0].text.upper() else "SKIP"
     except Exception as e:
-        logging.error(f"Claude ошибка: {e}")
+        logging.error(f"Claude: {e}")
         return "SKIP"
 
-def ask_deepseek(signal: dict) -> str:
+def ask_deepseek(signal):
     try:
         r = requests.post(
             "https://api.deepseek.com/v1/chat/completions",
@@ -209,13 +201,12 @@ def ask_deepseek(signal: dict) -> str:
                   "max_tokens": 50},
             timeout=30
         )
-        answer = r.json()["choices"][0]["message"]["content"].upper()
-        return "BUY" if "BUY" in answer else "SKIP"
+        return "BUY" if "BUY" in r.json()["choices"][0]["message"]["content"].upper() else "SKIP"
     except Exception as e:
-        logging.error(f"DeepSeek ошибка: {e}")
+        logging.error(f"DeepSeek: {e}")
         return "SKIP"
 
-def ask_gpt(signal: dict) -> str:
+def ask_gpt(signal):
     try:
         r = requests.post(
             "https://api.openai.com/v1/chat/completions",
@@ -225,14 +216,13 @@ def ask_gpt(signal: dict) -> str:
                   "max_tokens": 50},
             timeout=30
         )
-        answer = r.json()["choices"][0]["message"]["content"].upper()
-        return "BUY" if "BUY" in answer else "SKIP"
+        return "BUY" if "BUY" in r.json()["choices"][0]["message"]["content"].upper() else "SKIP"
     except Exception as e:
-        logging.error(f"GPT ошибка: {e}")
+        logging.error(f"GPT: {e}")
         return "SKIP"
 
-# ─── КОНСИЛИУМ ──────────────────────────────────────────────────────────────
-def run_council(signal: dict):
+# ─── ТОРГОВЫЙ КОНСИЛИУМ (3 AI) ──────────────────────────────────────────────
+def run_council(signal):
     print("=" * 50)
     print(f"СИГНАЛ: {datetime.now().strftime('%d.%m %H:%M')} {signal}")
 
@@ -273,6 +263,106 @@ def run_council(signal: dict):
     log_to_sheets(signal, votes, decision, buy_count, skip_reason)
     return decision, buy_count, votes
 
+# ═══════════════════════════════════════════════════════════════════════════
+# СТРАТЕГИЧЕСКИЙ КОНСИЛИУМ (4 AI — включая Gemini)
+# Для разработки и обсуждения новых стратегий
+# ═══════════════════════════════════════════════════════════════════════════
+
+V15_PROMPT = """Ты — эксперт по криптотрейдингу и алгоритмическим стратегиям.
+
+КОНТЕКСТ:
+У меня уже работает стратегия v13 на BTC/USDT 1H:
+- Mean Reversion на Bollinger Bands(20, 2.0)
+- Вход в пределах 2% от нижней BB
+- RSI(14) < 42 ИЛИ Stochastic разворот < 35
+- EMA200 макро фильтр (только лонги в бычьем тренде)
+- ATR(14) × 1.5 стоп-лосс, TP = верхняя BB
+- Результаты: 71 сделка за 1.4 года, WR 39%, PF 1.39, Max DD 5.39% при 50% депо
+- Edge есть, но мало сделок (~4-5/мес)
+
+ЗАДАЧА:
+Хочу добавить v15 — ДОПОЛНИТЕЛЬНУЮ стратегию которая не дублирует v13, а ловит другие движения BTC. Цель: суммарно 7-9 сделок в месяц.
+
+ПРЕДЛАГАЕМАЯ КОНЦЕПЦИЯ V15 (EMA Pullback на BTC 4H):
+1. Макро тренд: close > EMA200
+2. Локальный тренд: EMA21 > EMA200
+3. Триггер: цена в зоне EMA21 ±1.5%
+4. RSI(14): 38-55 (охлаждение, НЕ перепроданность как в v13)
+5. Объём > SMA(20) × 1.2
+6. Бычья свеча (close > open)
+7. SL: ATR(14) × 1.5, TP: R/R = 2.0 (фиксированный)
+
+ОТВЕТЬ ЧЁТКО НА 5 ВОПРОСОВ:
+
+1. ОЦЕНКА КОНЦЕПЦИИ (1-10): обоснуй коротко.
+2. ПЕРЕСЕЧЕНИЕ С V13: насколько v15 будет дублировать сигналы v13?
+3. СЛАБЫЕ МЕСТА: какие условия могут не сработать на BTC 4H?
+4. УЛУЧШЕНИЯ: 2-3 конкретных улучшения (параметры, фильтры, логика).
+5. АЛЬТЕРНАТИВА: если моя концепция плохая — предложи ЛУЧШУЮ стратегию для дополнения v13.
+
+Отвечай структурированно, на русском языке, без воды."""
+
+def council_ask_claude(prompt):
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        msg = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return msg.content[0].text
+    except Exception as e:
+        return f"❌ Claude ошибка: {e}"
+
+def council_ask_deepseek(prompt):
+    try:
+        r = requests.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"},
+            json={"model": "deepseek-chat",
+                  "messages": [{"role": "user", "content": prompt}],
+                  "max_tokens": 2000, "temperature": 0.7},
+            timeout=120
+        )
+        if r.status_code != 200:
+            return f"❌ DeepSeek HTTP {r.status_code}: {r.text[:200]}"
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"❌ DeepSeek ошибка: {e}"
+
+def council_ask_gpt(prompt):
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={"model": "gpt-4o-mini",
+                  "messages": [{"role": "user", "content": prompt}],
+                  "max_tokens": 2000, "temperature": 0.7},
+            timeout=120
+        )
+        if r.status_code != 200:
+            return f"❌ GPT HTTP {r.status_code}: {r.text[:200]}"
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"❌ GPT ошибка: {e}"
+
+def council_ask_gemini(prompt):
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        r = requests.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json={"contents": [{"parts": [{"text": prompt}]}],
+                  "generationConfig": {"maxOutputTokens": 2000, "temperature": 0.7}},
+            timeout=120
+        )
+        if r.status_code != 200:
+            return f"❌ Gemini HTTP {r.status_code}: {r.text[:200]}"
+        data = r.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        return f"❌ Gemini ошибка: {e}"
+
 # ─── ROUTES ─────────────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -312,7 +402,6 @@ def tg_test():
 
 @app.route("/report", methods=["GET"])
 def report():
-    """Ручной запуск отчёта в любое время."""
     weekly_report()
     return jsonify({"status": "report sent"})
 
@@ -321,10 +410,47 @@ def health():
     return jsonify({
         "status": "ok",
         "time":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "sheets": "configured" if GS_JSON else "NOT configured"
+        "sheets": "configured" if GS_JSON else "NOT configured",
+        "gemini": "configured" if GEMINI_API_KEY else "NOT configured"
     })
 
-# ─── SCHEDULER (еженедельный отчёт) ─────────────────────────────────────────
+@app.route("/council_v15", methods=["GET"])
+def council_v15():
+    """Стратегический консилиум: 4 AI обсуждают v15."""
+    logging.info("Запуск стратегического консилиума v15...")
+
+    results = {}
+
+    logging.info("Спрашиваю Claude...")
+    results["claude"] = council_ask_claude(V15_PROMPT)
+
+    logging.info("Спрашиваю DeepSeek...")
+    results["deepseek"] = council_ask_deepseek(V15_PROMPT)
+
+    logging.info("Спрашиваю GPT...")
+    results["gpt"] = council_ask_gpt(V15_PROMPT)
+
+    logging.info("Спрашиваю Gemini...")
+    results["gemini"] = council_ask_gemini(V15_PROMPT)
+
+    # Отправить в Telegram
+    for ai_name, answer in results.items():
+        icon = {"claude": "🟣", "deepseek": "🔵", "gpt": "🟢", "gemini": "🟡"}
+        header = f"{icon.get(ai_name, '⚪')} <b>{ai_name.upper()}</b> — v15 анализ\n\n"
+        send_telegram(header + answer[:3900])
+
+    send_telegram("✅ <b>Консилиум v15 завершён.</b>\nВсе 4 мнения выше. Анализируй и присылай мне в чат.")
+
+    return jsonify({
+        "status": "council complete",
+        "models": list(results.keys()),
+        "claude_length":   len(results.get("claude", "")),
+        "deepseek_length": len(results.get("deepseek", "")),
+        "gpt_length":      len(results.get("gpt", "")),
+        "gemini_length":   len(results.get("gemini", ""))
+    })
+
+# ─── SCHEDULER ──────────────────────────────────────────────────────────────
 scheduler = BackgroundScheduler()
 scheduler.add_job(weekly_report, "cron", day_of_week="mon", hour=9, minute=0)
 scheduler.start()
