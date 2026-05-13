@@ -515,11 +515,13 @@ def council_v15():
     except Exception as e:
         results["gemini"] = f"ERROR: {e}"
 
-    # Отправить в Telegram
+   # Отправить в Telegram
     for ai_name, answer in results.items():
         emoji = {"claude": "🟣", "deepseek": "🔵", "gpt": "🟢", "gemini": "🟡"}
         short = answer[:3500] if not answer.startswith("ERROR") else answer
-        msg = f"{emoji.get(ai_name, '⚪')} <b>{ai_name.upper()}</b> — v15 анализ\n{short}"
+        # Убираем символы которые ломают HTML парсинг Telegram
+        safe = short.replace("<", "‹").replace(">", "›").replace("&", "&amp;")
+        msg = f"{emoji.get(ai_name, '⚪')} <b>{ai_name.upper()}</b> — v15 анализ\n{safe}"
         send_telegram(msg)
 
     send_telegram("✅ Консилиум v15 завершён.\nВсе 4 мнения выше. Анализируй и присылай мне в чат.")
