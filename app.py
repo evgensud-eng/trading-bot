@@ -242,21 +242,22 @@ def ask_gemini(signal):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
         payload = {
             "contents": [{"parts": [{"text": build_prompt(signal)}]}],
-            "generationConfig": {"maxOutputTokens": 50}
+            "generationConfig": {
+                "maxOutputTokens": 50,
+                "thinkingConfig": {"thinkingBudget": 0}
+            }
         }
         r = requests.post(url, json=payload, timeout=30)
         if r.status_code != 200:
             logging.error(f"Gemini HTTP {r.status_code}: {r.text[:200]}")
             return "ERROR"
         data = r.json()
-        # Gemini 2.5 может вернуть разные структуры
         candidates = data.get("candidates", [])
         if not candidates:
             logging.error(f"Gemini нет candidates: {data}")
             return "ERROR"
         content = candidates[0].get("content", {})
         parts = content.get("parts", [])
-        # Ищем текстовый part (пропускаем thought parts)
         answer = ""
         for part in parts:
             if "text" in part:
@@ -274,7 +275,6 @@ def run_council(signal):
     print("=" * 50)
     print(f"СИГНАЛ: {datetime.now().strftime('%d.%m %H:%M')} {signal}")
 
-    # Опрос всех 4 AI
     claude_vote   = ask_claude(signal)
     deepseek_vote = ask_deepseek(signal)
     gpt_vote      = ask_gpt(signal)
@@ -287,19 +287,13 @@ def run_council(signal):
         "gemini":   gemini_vote
     }
 
-    # Считаем только успешные ответы (не ERROR)
     active_votes = {k: v for k, v in votes.items() if v != "ERROR"}
     error_votes  = {k: v for k, v in votes.items() if v == "ERROR"}
     total_active = len(active_votes)
     buy_count    = sum(1 for v in active_votes.values() if v == "BUY")
 
-    # Логика решения:
-    # 4 из 4 ответили → нужно 3+ BUY
-    # 3 из 4 ответили → нужно 2+ BUY
-    # 2 из 4 ответили → нужно 2 BUY
-    # 1 или 0 ответили → SKIP (ненадёжно)
     if total_active >= 3:
-        majority = (total_active // 2) + 1  # 3→2, 4→3
+        majority = (total_active // 2) + 1
         decision = "BUY" if buy_count >= majority else "SKIP"
     else:
         decision = "SKIP"
@@ -313,7 +307,6 @@ def run_council(signal):
 
     skip_reason = ""
 
-    # Формируем голоса для Telegram
     def vote_emoji(v):
         if v == "BUY":   return "🟢 BUY"
         if v == "SKIP":  return "⚪ SKIP"
@@ -416,8 +409,6 @@ def health():
 # ─── COUNCIL V15 (консультация по стратегии) ────────────────────────────────
 @app.route("/council_v15", methods=["GET"])
 def council_v15():
-    """Консилиум по разработке v15 — все 4 AI дают мнение."""
-
     STRATEGY_PROMPT = """Ты — эксперт по криптотрейдингу и алгоритмическим стратегиям. 
 
 КОНТЕКСТ:
@@ -500,12 +491,15 @@ def council_v15():
     except Exception as e:
         results["gpt"] = f"ERROR: {e}"
 
-# Gemini
+    # Gemini
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
         payload = {
             "contents": [{"parts": [{"text": STRATEGY_PROMPT}]}],
-            "generationConfig": {"maxOutputTokens": 1500}
+            "generationConfig": {
+                "maxOutputTokens": 1500,
+                "thinkingConfig": {"thinkingBudget": 0}
+            }
         }
         r = requests.post(url, json=payload, timeout=90)
         if r.status_code == 200:
@@ -520,6 +514,7 @@ def council_v15():
             results["gemini"] = f"ERROR HTTP {r.status_code}: {r.text[:300]}"
     except Exception as e:
         results["gemini"] = f"ERROR: {e}"
+
     # Отправить в Telegram
     for ai_name, answer in results.items():
         emoji = {"claude": "🟣", "deepseek": "🔵", "gpt": "🟢", "gemini": "🟡"}
