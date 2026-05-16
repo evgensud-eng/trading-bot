@@ -22,6 +22,34 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 SPREADSHEET_ID     = os.environ.get("SPREADSHEET_ID", "")
 GS_JSON            = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
+# ─── STRATEGY CONFIG ────────────────────────────────────────────────────────
+# Чтобы добавить новую стратегию — добавь словарь сюда. Без правок промптов и сообщений.
+STRATEGY_CONFIGS = {
+    "v13": {
+        "name": "Mean Reversion BB",
+        "description": "Mean Reversion on Bollinger Bands lower band, BTC/USDT 1H",
+        "tf": "1H",
+        "type": "contrarian",
+        "ai_rules": "BUY only if R/R >= 1.5 and RSI < 45 and signal is LONG. Otherwise SKIP.",
+        "uses_consilium": True,
+        "uses_tp_rr": True,
+        "uses_rsi": True
+    },
+    "donchian_daily": {
+        "name": "Donchian Breakout",
+        "description": "Donchian Channel Breakout (Turtle System) on BTC/USDT Daily. Entry on close above 40-day high, exit on 30-day low. Above SMA200 trend filter.",
+        "tf": "1D",
+        "type": "trend_following",
+        "ai_rules": "BUY if entry confirmed by Daily close above 40d high AND above SMA200 (trend OK) AND stop distance < 15% from entry. This is trend-following — high RSI is NORMAL (don't reject for overbought). Reject only if stop is unreasonably far or trend filter failed. Otherwise SKIP.",
+        "uses_consilium": True,
+        "uses_tp_rr": False,
+        "uses_rsi": False
+    }
+}
+
+def get_strategy_config(strategy_key):
+    return STRATEGY_CONFIGS.get(strategy_key, STRATEGY_CONFIGS["v13"])
+
 # ─── GOOGLE SHEETS ──────────────────────────────────────────────────────────
 def get_sheet():
     try:
@@ -147,38 +175,65 @@ def send_telegram(message):
     except Exception as e:
         logging.error(f"Telegram ошибка: {e}")
 
-# ─── АНАЛИЗ ПРИЧИНЫ SKIP ────────────────────────────────────────────────────
+# ─── АНАЛИЗ ПРИЧИНЫ SKIP (strategy-aware) ───────────────────────────────────
 def analyze_skip_reason(signal, votes):
+    cfg = get_strategy_config(signal.get("strategy", "v13"))
     reasons = []
-    try:
-        rsi = float(signal.get("rsi", 50))
-        rr  = float(signal.get("rr", 0))
-        if rsi > 45:
-            reasons.append(f"RSI высокий ({rsi:.1f})")
-        if rr < 1.5:
-            reasons.append(f"R/R низкий ({rr:.1f})")
-        skippers = [ai for ai, vote in votes.items() if vote == "SKIP"]
-        if skippers:
-            reasons.append(f"против: {', '.join(skippers)}")
-    except Exception:
-        reasons.append("условия не выполнены")
+
+    if cfg["uses_tp_rr"] and cfg["uses_rsi"]:
+        # v13-style анализ
+        try:
+            rsi = float(signal.get("rsi", 50))
+            rr  = float(signal.get("rr", 0))
+            if rsi > 45:
+                reasons.append(f"RSI высокий ({rsi:.1f})")
+            if rr < 1.5:
+                reasons.append(f"R/R низкий ({rr:.1f})")
+        except Exception:
+            reasons.append("условия не выполнены")
+    else:
+        # donchian-style анализ (нет TP/RSI)
+        try:
+            price = float(signal.get("price", 0))
+            sl    = float(signal.get("sl", 0))
+            if price > 0 and sl > 0:
+                sl_pct = abs(price - sl) / price * 100
+                if sl_pct > 15:
+                    reasons.append(f"SL далеко ({sl_pct:.1f}%)")
+        except Exception:
+            pass
+
+    skippers = [ai for ai, vote in votes.items() if vote == "SKIP"]
+    if skippers:
+        reasons.append(f"против: {', '.join(skippers)}")
     return " | ".join(reasons) if reasons else "консилиум отклонил"
 
-# ─── ПРОМПТ ──────────────────────────────────────────────────────────────────
+# ─── ПРОМПТ (strategy-aware) ────────────────────────────────────────────────
 def build_prompt(signal):
+    cfg = get_strategy_config(signal.get("strategy", "v13"))
+
+    signal_lines = [
+        f"- Symbol: {signal.get('symbol', 'BTC')}",
+        f"- Type: {signal.get('type', 'LONG')}",
+        f"- Price: {signal.get('price')}",
+        f"- Stop Loss: {signal.get('sl')}",
+    ]
+    if cfg["uses_tp_rr"]:
+        signal_lines.append(f"- Take Profit: {signal.get('tp')}")
+        signal_lines.append(f"- Risk/Reward: {signal.get('rr')}")
+    if cfg["uses_rsi"]:
+        signal_lines.append(f"- RSI: {signal.get('rsi')}")
+    signal_lines.append(f"- Strategy: {cfg['description']}")
+    signal_lines.append(f"- Timeframe: {cfg['tf']}")
+
+    signal_block = "\n".join(signal_lines)
+
     return f"""You are a crypto trading risk manager. Analyze this BTC trading signal and respond with ONLY one word: BUY or SKIP.
 
 Signal:
-- Symbol: {signal.get('symbol', 'BTC')}
-- Type: {signal.get('type', 'LONG')}
-- Price: {signal.get('price')}
-- Stop Loss: {signal.get('sl')}
-- Take Profit: {signal.get('tp')}
-- Risk/Reward: {signal.get('rr')}
-- RSI: {signal.get('rsi')}
-- Strategy: Mean Reversion on Bollinger Bands lower band, BTC/USDT 1H
+{signal_block}
 
-Rules: BUY only if R/R >= 1.5 and RSI < 45 and signal is LONG. Otherwise SKIP.
+Rules: {cfg['ai_rules']}
 Answer with one word only: BUY or SKIP"""
 
 # ─── AI ВЫЗОВЫ ───────────────────────────────────────────────────────────────
@@ -272,8 +327,9 @@ def ask_gemini(signal):
 
 # ─── КОНСИЛИУМ (4 AI) ───────────────────────────────────────────────────────
 def run_council(signal):
+    cfg = get_strategy_config(signal.get("strategy", "v13"))
     print("=" * 50)
-    print(f"СИГНАЛ: {datetime.now().strftime('%d.%m %H:%M')} {signal}")
+    print(f"СИГНАЛ ({cfg['name']}): {datetime.now().strftime('%d.%m %H:%M')} {signal}")
 
     claude_vote   = ask_claude(signal)
     deepseek_vote = ask_deepseek(signal)
@@ -316,32 +372,63 @@ def run_council(signal):
     if error_votes:
         errors_text = f"\n⚠️ Ошибки: {', '.join(error_votes.keys())}"
 
+    # ─── Формируем Telegram сообщение в зависимости от стратегии ───────────
     if decision == "BUY":
-        msg = (
-            f"🟢 <b>СИГНАЛ: ОТКРЫТЬ СДЕЛКУ</b>\n\n"
-            f"💰 {signal.get('symbol')} {signal.get('type')}\n"
-            f"📈 Цена: <b>{signal.get('price')}</b>\n"
-            f"🛡 SL: {signal.get('sl')}  |  🎯 TP: {signal.get('tp')}\n"
-            f"⚖️ R/R: {signal.get('rr')}  |  📊 RSI: {signal.get('rsi')}\n\n"
-            f"🤖 Консилиум: <b>{buy_count}/{total_active}</b>\n"
-            f"   Claude:   {vote_emoji(claude_vote)}\n"
-            f"   DeepSeek: {vote_emoji(deepseek_vote)}\n"
-            f"   GPT:      {vote_emoji(gpt_vote)}\n"
-            f"   Gemini:   {vote_emoji(gemini_vote)}\n"
-            f"📋 Стратегия: {signal.get('strategy', 'v13')}{errors_text}"
-        )
+        if cfg["uses_tp_rr"]:
+            # v13-style: с TP, R/R, RSI
+            msg = (
+                f"🟢 <b>СИГНАЛ: ОТКРЫТЬ СДЕЛКУ</b>\n\n"
+                f"💰 {signal.get('symbol')} {signal.get('type')}\n"
+                f"📈 Цена: <b>{signal.get('price')}</b>\n"
+                f"🛡 SL: {signal.get('sl')}  |  🎯 TP: {signal.get('tp')}\n"
+                f"⚖️ R/R: {signal.get('rr')}  |  📊 RSI: {signal.get('rsi')}\n\n"
+                f"🤖 Консилиум: <b>{buy_count}/{total_active}</b>\n"
+                f"   Claude:   {vote_emoji(claude_vote)}\n"
+                f"   DeepSeek: {vote_emoji(deepseek_vote)}\n"
+                f"   GPT:      {vote_emoji(gpt_vote)}\n"
+                f"   Gemini:   {vote_emoji(gemini_vote)}\n"
+                f"📋 Стратегия: {signal.get('strategy', 'v13')} ({cfg['tf']}){errors_text}"
+            )
+        else:
+            # donchian-style: без TP/R/R/RSI, акцент на trend-following
+            msg = (
+                f"🟢 <b>СИГНАЛ: ОТКРЫТЬ СДЕЛКУ (Breakout)</b>\n\n"
+                f"💰 {signal.get('symbol')} {signal.get('type')}\n"
+                f"📈 Цена входа: <b>{signal.get('price')}</b>\n"
+                f"🛡 SL: {signal.get('sl')} (Donchian exit)\n"
+                f"⏱ Таймфрейм: <b>{cfg['tf']}</b>\n"
+                f"📋 Тип: Trend-following (Turtle)\n\n"
+                f"🤖 Консилиум: <b>{buy_count}/{total_active}</b>\n"
+                f"   Claude:   {vote_emoji(claude_vote)}\n"
+                f"   DeepSeek: {vote_emoji(deepseek_vote)}\n"
+                f"   GPT:      {vote_emoji(gpt_vote)}\n"
+                f"   Gemini:   {vote_emoji(gemini_vote)}\n"
+                f"📋 Стратегия: {signal.get('strategy')} ({cfg['name']}){errors_text}"
+            )
     else:
         skip_reason = analyze_skip_reason(signal, active_votes)
-        msg = (
-            f"⚪ <b>Сигнал отклонён</b> ({buy_count}/{total_active})\n\n"
-            f"💰 {signal.get('symbol')} @ {signal.get('price')}\n"
-            f"📊 RSI: {signal.get('rsi')}  |  ⚖️ R/R: {signal.get('rr')}\n\n"
-            f"🤖 Claude:   {vote_emoji(claude_vote)}\n"
-            f"   DeepSeek: {vote_emoji(deepseek_vote)}\n"
-            f"   GPT:      {vote_emoji(gpt_vote)}\n"
-            f"   Gemini:   {vote_emoji(gemini_vote)}\n"
-            f"❌ Причина: {skip_reason}{errors_text}"
-        )
+        if cfg["uses_tp_rr"]:
+            msg = (
+                f"⚪ <b>Сигнал отклонён</b> ({buy_count}/{total_active})\n\n"
+                f"💰 {signal.get('symbol')} @ {signal.get('price')}\n"
+                f"📊 RSI: {signal.get('rsi')}  |  ⚖️ R/R: {signal.get('rr')}\n\n"
+                f"🤖 Claude:   {vote_emoji(claude_vote)}\n"
+                f"   DeepSeek: {vote_emoji(deepseek_vote)}\n"
+                f"   GPT:      {vote_emoji(gpt_vote)}\n"
+                f"   Gemini:   {vote_emoji(gemini_vote)}\n"
+                f"❌ Причина: {skip_reason}{errors_text}"
+            )
+        else:
+            msg = (
+                f"⚪ <b>Сигнал отклонён</b> ({buy_count}/{total_active}) — {cfg['name']}\n\n"
+                f"💰 {signal.get('symbol')} @ {signal.get('price')}\n"
+                f"🛡 SL: {signal.get('sl')}  |  ⏱ {cfg['tf']}\n\n"
+                f"🤖 Claude:   {vote_emoji(claude_vote)}\n"
+                f"   DeepSeek: {vote_emoji(deepseek_vote)}\n"
+                f"   GPT:      {vote_emoji(gpt_vote)}\n"
+                f"   Gemini:   {vote_emoji(gemini_vote)}\n"
+                f"❌ Причина: {skip_reason}{errors_text}"
+            )
 
     send_telegram(msg)
     log_to_sheets(signal, votes, decision, buy_count, total_active, skip_reason)
@@ -382,6 +469,20 @@ def test():
         "votes": f"{buy_count}/{total}", "details": votes
     })
 
+@app.route("/test_donchian", methods=["GET"])
+def test_donchian():
+    """Тестовый эндпоинт для проверки Donchian Daily — пинай через браузер."""
+    signal = {
+        "symbol": "BTC", "type": "LONG",
+        "price": 82000, "sl": 75000,
+        "strategy": "donchian_daily"
+    }
+    decision, buy_count, total, votes = run_council(signal)
+    return jsonify({
+        "status": "donchian test fired", "decision": decision,
+        "votes": f"{buy_count}/{total}", "details": votes
+    })
+
 @app.route("/tg_test", methods=["GET"])
 def tg_test():
     send_telegram("✅ Telegram тест — бот работает\n🤖 4 AI: Claude, DeepSeek, GPT, Gemini")
@@ -398,6 +499,7 @@ def health():
         "status": "ok",
         "time":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "sheets": "configured" if GS_JSON else "NOT configured",
+        "strategies": list(STRATEGY_CONFIGS.keys()),
         "ai_keys": {
             "claude":   "ok" if ANTHROPIC_API_KEY else "MISSING",
             "deepseek": "ok" if DEEPSEEK_API_KEY else "MISSING",
