@@ -494,6 +494,72 @@ def report():
     return jsonify({"status": "report sent"})
 
 @app.route("/health", methods=["GET"])
+ПАТЧ ДЛЯ app.py — диагностика доступности Bybit с Railway
+=========================================================
+
+ЦЕЛЬ: проверить, отдаёт ли Bybit kline API данные с Railway IP,
+ДО того как писать полный код варианта D. Ничего существующего не ломает —
+добавляется только один новый route. webhook/консилиум/Sheets не трогаются.
+
+ШАГ 1. В app.py, в секции "─── ROUTES ───" (рядом с @app.route("/health"))
+        ДОБАВЬ этот новый блок (вставь перед строкой @app.route("/health")):
+
+# ─── ДИАГНОСТИКА BYBIT DATA API (для варианта D) ────────────────────────────
+@app.route("/bybit_check", methods=["GET"])
+def bybit_check():
+    """Проверка доступности публичного Bybit kline с Railway IP.
+    Не требует ключей. Открыть в браузере, посмотреть JSON-ответ."""
+    out = {}
+    for sym in ["BTCUSDT", "BNBUSDT", "XRPUSDT"]:
+        try:
+            r = requests.get(
+                "https://api.bybit.com/v5/market/kline",
+                params={"category": "spot", "symbol": sym,
+                        "interval": "D", "limit": 5},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=15
+            )
+            body = {}
+            try:
+                body = r.json()
+            except Exception:
+                body = {"raw": r.text[:300]}
+            lst = body.get("result", {}).get("list", []) if isinstance(body, dict) else []
+            out[sym] = {
+                "http_status": r.status_code,
+                "retCode": body.get("retCode") if isinstance(body, dict) else None,
+                "retMsg": body.get("retMsg") if isinstance(body, dict) else None,
+                "candles_returned": len(lst),
+                "sample": lst[0][:6] if lst else None
+            }
+        except Exception as e:
+            out[sym] = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
+    return jsonify({
+        "status": "bybit data api check",
+        "note": "Если candles_returned > 0 и http_status 200 — вариант D жизнеспособен с Railway",
+        "results": out
+    })
+
+ШАГ 2. Закоммить app.py на GitHub (как делал раньше: Edit file → вставить →
+        Commit changes). Railway задеплоит сам за 1-2 мин.
+
+ШАГ 3. Открой в браузере:
+        https://web-production-62617.up.railway.app/bybit_check
+
+ШАГ 4. Пришли в чат полный JSON-ответ что увидишь.
+
+ИНТЕРПРЕТАЦИЯ (что это значит):
+- candles_returned: 5, http_status: 200  →  ✅ D жизнеспособен, пишу полный код D
+- http_status: 403 / ошибка               →  ⚠️ Bybit блокирует и Railway IP,
+                                              переключаемся на резервный
+                                              data-источник (проверю варианты:
+                                              Coinbase / Kraken / OKX public API)
+
+ВАЖНО: этот патч ВРЕМЕННЫЙ, диагностический. После проверки и старта
+полного D-кода этот route можно убрать (или оставить — он безвредный).
+Существующий webhook + forward-тест v13/Donchian продолжают работать
+без изменений на всём протяжении.
+
 def health():
     return jsonify({
         "status": "ok",
