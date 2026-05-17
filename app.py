@@ -493,17 +493,6 @@ def report():
     weekly_report()
     return jsonify({"status": "report sent"})
 
-@app.route("/health", methods=["GET"])
-ПАТЧ ДЛЯ app.py — диагностика доступности Bybit с Railway
-=========================================================
-
-ЦЕЛЬ: проверить, отдаёт ли Bybit kline API данные с Railway IP,
-ДО того как писать полный код варианта D. Ничего существующего не ломает —
-добавляется только один новый route. webhook/консилиум/Sheets не трогаются.
-
-ШАГ 1. В app.py, в секции "─── ROUTES ───" (рядом с @app.route("/health"))
-        ДОБАВЬ этот новый блок (вставь перед строкой @app.route("/health")):
-
 # ─── ДИАГНОСТИКА BYBIT DATA API (для варианта D) ────────────────────────────
 @app.route("/bybit_check", methods=["GET"])
 def bybit_check():
@@ -519,7 +508,6 @@ def bybit_check():
                 headers={"User-Agent": "Mozilla/5.0"},
                 timeout=15
             )
-            body = {}
             try:
                 body = r.json()
             except Exception:
@@ -540,26 +528,7 @@ def bybit_check():
         "results": out
     })
 
-ШАГ 2. Закоммить app.py на GitHub (как делал раньше: Edit file → вставить →
-        Commit changes). Railway задеплоит сам за 1-2 мин.
-
-ШАГ 3. Открой в браузере:
-        https://web-production-62617.up.railway.app/bybit_check
-
-ШАГ 4. Пришли в чат полный JSON-ответ что увидишь.
-
-ИНТЕРПРЕТАЦИЯ (что это значит):
-- candles_returned: 5, http_status: 200  →  ✅ D жизнеспособен, пишу полный код D
-- http_status: 403 / ошибка               →  ⚠️ Bybit блокирует и Railway IP,
-                                              переключаемся на резервный
-                                              data-источник (проверю варианты:
-                                              Coinbase / Kraken / OKX public API)
-
-ВАЖНО: этот патч ВРЕМЕННЫЙ, диагностический. После проверки и старта
-полного D-кода этот route можно убрать (или оставить — он безвредный).
-Существующий webhook + forward-тест v13/Donchian продолжают работать
-без изменений на всём протяжении.
-
+@app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
@@ -683,7 +652,7 @@ def council_v15():
     except Exception as e:
         results["gemini"] = f"ERROR: {e}"
 
-   # Отправить в Telegram
+    # Отправить в Telegram
     for ai_name, answer in results.items():
         emoji = {"claude": "🟣", "deepseek": "🔵", "gpt": "🟢", "gemini": "🟡"}
         short = answer[:3500] if not answer.startswith("ERROR") else answer
