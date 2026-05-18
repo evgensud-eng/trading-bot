@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 import requests
@@ -112,6 +113,18 @@ def log_to_sheets(signal, votes, decision, buy_count, total_votes, skip_reason="
         return False
 
 # ─── ЕЖЕНЕДЕЛЬНЫЙ ОТЧЁТ ─────────────────────────────────────────────────────
+# Индексы колонок (фиксированы порядком log_to_sheets):
+# 0=Дата 1=Время 2=Символ 3=Тип 4=Цена 5=SL 6=TP 7=R/R 8=RSI
+# 9=Claude 10=DeepSeek 11=GPT 12=Gemini 13=Голоса 14=Решение 15=Стратегия 16=Причина SKIP
+_DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+def _parse_sheet_rows(sheet):
+    """Читает все строки листа, возвращает только валидные строки с данными.
+    Использует get_all_values() вместо get_all_records() — не зависит от заголовков.
+    Строка валидна если col[0] = дата YYYY-MM-DD и длина >= 15."""
+    all_values = sheet.get_all_values()
+    return [r for r in all_values if len(r) >= 15 and _DATE_RE.match(str(r[0]))]
+
 def weekly_report():
     logging.info("Генерирую еженедельный отчёт...")
     sheet = get_sheet()
@@ -119,20 +132,20 @@ def weekly_report():
         send_telegram("⚠️ Еженедельный отчёт: Sheets недоступен")
         return
     try:
-        all_rows = sheet.get_all_records()
-        if not all_rows:
+        data_rows = _parse_sheet_rows(sheet)
+        if not data_rows:
             send_telegram("📊 Еженедельный отчёт: данных пока нет")
             return
 
-        week_ago  = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-        week_rows = [r for r in all_rows if str(r.get("Дата", "")) >= week_ago]
-        total     = len(week_rows)
-        buy_count = sum(1 for r in week_rows if r.get("Решение") == "BUY")
+        week_ago   = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        week_rows  = [r for r in data_rows if r[0] >= week_ago]
+        total      = len(week_rows)
+        buy_count  = sum(1 for r in week_rows if r[14] == "BUY")
         skip_count = total - buy_count
 
         reason_counts = {}
         for r in week_rows:
-            reason = r.get("Причина SKIP", "")
+            reason = r[16] if len(r) > 16 else ""
             if reason:
                 reason_counts[reason] = reason_counts.get(reason, 0) + 1
         top_reasons = sorted(reason_counts.items(), key=lambda x: x[1], reverse=True)[:3]
@@ -140,7 +153,7 @@ def weekly_report():
 
         strategies = {}
         for r in week_rows:
-            s = r.get("Стратегия", "v13")
+            s = r[15] if len(r) > 15 and r[15] else "v13"
             strategies[s] = strategies.get(s, 0) + 1
         strat_text = "\n".join([f"   {k}: {v}" for k, v in strategies.items()])
 
@@ -666,8 +679,11 @@ def council_v15():
     return jsonify({"status": "council complete", "results": {k: v[:200] for k, v in results.items()}})
 
 # ─── SCHEDULER ──────────────────────────────────────────────────────────────
+# replace_existing=True + id предотвращают двойную регистрацию в одном процессе.
+# Если Railway запускает 2 воркера — добавь в start-команду: gunicorn --workers 1 app:app
 scheduler = BackgroundScheduler()
-scheduler.add_job(weekly_report, "cron", day_of_week="mon", hour=9, minute=0)
+scheduler.add_job(weekly_report, "cron", day_of_week="mon", hour=9, minute=0,
+                  id="weekly_report", replace_existing=True)
 scheduler.start()
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
