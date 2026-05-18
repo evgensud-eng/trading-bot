@@ -759,20 +759,49 @@ def _mvrv_z_now(mvrv_list):
         return 0.0
     return (mvrv_list[-1] - m) / s
 
+def _sp_closes_stooq():
+    """S&P daily closes из Stooq CSV. Колонки: Date,Open,High,Low,Close,Volume."""
+    r = requests.get("https://stooq.com/q/d/l/",
+                      params={"s": "^spx", "i": "d"}, timeout=30)
+    r.raise_for_status()
+    lines = r.text.strip().splitlines()
+    if len(lines) < 2 or not lines[0].lower().startswith("date"):
+        raise RuntimeError(f"Stooq формат неожиданный: {lines[:1]}")
+    closes = []
+    for ln in lines[1:]:
+        parts = ln.split(",")
+        if len(parts) >= 5 and parts[4] not in ("", "N/D"):
+            try:
+                closes.append(float(parts[4]))
+            except ValueError:
+                continue
+    return closes
+
+def _sp_closes_yahoo():
+    """Fallback: Yahoo Finance chart API (без ключа), ~3 мес дневных close."""
+    r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC",
+                      params={"range": "3mo", "interval": "1d"},
+                      headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+    r.raise_for_status()
+    res = r.json()["chart"]["result"][0]
+    quote = res["indicators"]["quote"][0]["close"]
+    return [c for c in quote if c is not None]
+
 def _get_sp_macro_ok():
-    """S&P 20d momentum >= 0 через Stooq CSV (без ключа). -> (bool|None, note)."""
-    try:
-        r = requests.get("https://stooq.com/q/d/l/", params={"s": "^spx", "i": "d"}, timeout=30)
-        r.raise_for_status()
-        rows = [ln.split(",") for ln in r.text.strip().splitlines()[1:] if ln]
-        closes = [float(x[4]) for x in rows if len(x) >= 5 and x[4] not in ("", "N/D")]
-        n = SLOT5["sp_mom_days"]
-        if len(closes) < n + 1:
-            return None, "S&P мало данных"
-        mom = closes[-1] / closes[-1 - n] - 1.0
-        return (mom >= 0), f"S&P 20d mom {mom*100:+.1f}%"
-    except Exception as e:
-        return None, f"S&P недоступен ({type(e).__name__})"
+    """S&P 20d momentum >= 0. Stooq основной, Yahoo fallback. -> (bool|None, note)."""
+    n = SLOT5["sp_mom_days"]
+    for name, fn in (("Stooq", _sp_closes_stooq), ("Yahoo", _sp_closes_yahoo)):
+        try:
+            closes = fn()
+            if len(closes) < n + 1:
+                logging.warning(f"S&P {name}: мало данных ({len(closes)}), пробую дальше")
+                continue
+            mom = closes[-1] / closes[-1 - n] - 1.0
+            return (mom >= 0), f"S&P 20d {mom*100:+.1f}% ({name})"
+        except Exception as e:
+            logging.warning(f"S&P {name} fail: {type(e).__name__} {e}")
+            continue
+    return None, "S&P недоступен (Stooq+Yahoo)"
 
 def _get_fng_now():
     try:
