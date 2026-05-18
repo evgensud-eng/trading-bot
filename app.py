@@ -711,15 +711,23 @@ def _slot5_tier(dd):
             return nm
     return None
 
-def _get_btc_history():
-    """CoinGecko full daily history (без ключа). -> (prices_list, current_price)."""
-    u = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-    r = requests.get(u, params={"vs_currency": "usd", "days": "max"}, timeout=40)
-    r.raise_for_status()
-    prices = [p[1] for p in r.json()["prices"]]
-    if len(prices) < 500:
-        raise RuntimeError(f"BTC мало точек: {len(prices)}")
-    return prices, prices[-1]
+# ATH цикла зафиксирован в Пункте 1 (PROJECT_1). Обновляется только если
+# текущая цена его превысит. История цены НЕ нужна — для тира достаточно price/ATH.
+SLOT5_ATH = 126198
+
+def _get_btc_price():
+    """Текущая цена BTC. CoinGecko simple/price (бесплатно, без ключа, не history).
+    Fallback на Coinbase spot если CoinGecko недоступен."""
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/simple/price",
+                          params={"ids": "bitcoin", "vs_currencies": "usd"}, timeout=20)
+        r.raise_for_status()
+        return float(r.json()["bitcoin"]["usd"])
+    except Exception as e:
+        logging.warning(f"CoinGecko price fail ({e}), пробую Coinbase")
+        r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=20)
+        r.raise_for_status()
+        return float(r.json()["data"]["amount"])
 
 def _get_mvrv_history():
     """CoinMetrics community CapMVRVCur (без ключа). -> (mvrv_list, current_mvrv)."""
@@ -797,10 +805,10 @@ def slot5_forward_check():
     """Еженедельная бумажная проверка Слота 5. НЕ торгует — логирует + Telegram."""
     logging.info("Слот5 forward-проверка...")
     try:
-        prices, price = _get_btc_history()
+        price = _get_btc_price()
         mvrv_list, mvrv = _get_mvrv_history()
         z = _mvrv_z_now(mvrv_list)
-        ath = max(prices)
+        ath = max(SLOT5_ATH, price)   # ATH-константа, растёт если новый максимум
         dd = price / ath
         tier = _slot5_tier(dd)
         cheap = mvrv <= SLOT5["mvrv_buy_thr"]
