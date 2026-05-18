@@ -720,12 +720,12 @@ def _get_btc_price():
     Fallback на Coinbase spot если CoinGecko недоступен."""
     try:
         r = requests.get("https://api.coingecko.com/api/v3/simple/price",
-                          params={"ids": "bitcoin", "vs_currencies": "usd"}, timeout=20)
+                          params={"ids": "bitcoin", "vs_currencies": "usd"}, timeout=8)
         r.raise_for_status()
         return float(r.json()["bitcoin"]["usd"])
     except Exception as e:
         logging.warning(f"CoinGecko price fail ({e}), пробую Coinbase")
-        r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=20)
+        r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=8)
         r.raise_for_status()
         return float(r.json()["data"]["amount"])
 
@@ -733,13 +733,15 @@ def _get_mvrv_history():
     """CoinMetrics community CapMVRVCur (без ключа). -> (mvrv_list, current_mvrv)."""
     url = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
     vals, pt = [], None
-    for _ in range(60):
+    # page_size=10000, истории ~4500 точек -> 1 страница. Потолок 3 = запас,
+    # НЕ 60 (десятки запросов = WORKER TIMEOUT на Railway).
+    for _ in range(3):
         p = {"assets": "btc", "metrics": "CapMVRVCur", "start_time": "2014-01-01",
              "end_time": datetime.now().strftime("%Y-%m-%d"),
              "page_size": 10000, "frequency": "1d"}
         if pt:
             p["next_page_token"] = pt
-        r = requests.get(url, params=p, timeout=40)
+        r = requests.get(url, params=p, timeout=10)
         r.raise_for_status()
         j = r.json()
         for row in j.get("data", []):
@@ -762,7 +764,7 @@ def _mvrv_z_now(mvrv_list):
 def _sp_closes_stooq():
     """S&P daily closes из Stooq CSV. Колонки: Date,Open,High,Low,Close,Volume."""
     r = requests.get("https://stooq.com/q/d/l/",
-                      params={"s": "^spx", "i": "d"}, timeout=30)
+                      params={"s": "^spx", "i": "d"}, timeout=6)
     r.raise_for_status()
     lines = r.text.strip().splitlines()
     if len(lines) < 2 or not lines[0].lower().startswith("date"):
@@ -781,7 +783,7 @@ def _sp_closes_yahoo():
     """Fallback: Yahoo Finance chart API (без ключа), ~3 мес дневных close."""
     r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC",
                       params={"range": "3mo", "interval": "1d"},
-                      headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+                      headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
     r.raise_for_status()
     res = r.json()["chart"]["result"][0]
     quote = res["indicators"]["quote"][0]["close"]
@@ -805,7 +807,7 @@ def _get_sp_macro_ok():
 
 def _get_fng_now():
     try:
-        j = requests.get("https://api.alternative.me/fng/?limit=1&format=json", timeout=20).json()
+        j = requests.get("https://api.alternative.me/fng/?limit=1&format=json", timeout=6).json()
         return int(j["data"][0]["value"])
     except Exception:
         return None
