@@ -2,6 +2,7 @@ import os
 import re
 import json
 import logging
+import statistics
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
@@ -171,6 +172,9 @@ def weekly_report():
     except Exception as e:
         logging.error(f"Ошибка отчёта: {e}")
         send_telegram(f"⚠️ Ошибка отчёта: {e}")
+    # Слот 5 forward — бумажный мониторинг. Своя обработка ошибок внутри,
+    # запускается всегда после отчёта (даже если отчёт упал).
+    slot5_forward_check()
 
 # ─── TELEGRAM ───────────────────────────────────────────────────────────────
 def send_telegram(message):
@@ -506,6 +510,12 @@ def report():
     weekly_report()
     return jsonify({"status": "report sent"})
 
+@app.route("/slot5_check", methods=["GET"])
+def slot5_check_route():
+    """Ручной запуск forward-проверки Слота 5 (для теста, без денег)."""
+    slot5_forward_check()
+    return jsonify({"status": "slot5 forward check done"})
+
 # ─── ДИАГНОСТИКА BYBIT DATA API (для варианта D) ────────────────────────────
 @app.route("/bybit_check", methods=["GET"])
 def bybit_check():
@@ -677,6 +687,190 @@ def council_v15():
     send_telegram("✅ Консилиум v15 завершён.\nВсе 4 мнения выше. Анализируй и присылай мне в чат.")
 
     return jsonify({"status": "council complete", "results": {k: v[:200] for k, v in results.items()}})
+
+# ─── СЛОТ 5: FORWARD-МОНИТОРИНГ (бумажный, без денег) ───────────────────────
+# Параметры ЗАМОРОЖЕНЫ 17.05.2026 (PROJECT_1_SLOT5_FORWARD_PROCEDURE.md).
+# Изменение любой константы = форвард обнуляется. НЕ править без решения.
+SLOT5 = {
+    "capital": 40000,
+    "z_start": 1.52,   # срез 20%   (заморожено)
+    "z_main":  2.28,   # срез 30%   (заморожено)
+    "z_full":  3.05,   # выход 100% (заморожено)
+    "mvrv_buy_thr": 1.0,
+    "fg_capit": 20,
+    "sp_mom_days": 20,
+    "confluence_min": 3,
+    # тиры: имя -> (hi, lo, вес доли depo). dd = price/ATH. D: x<=hi.
+    "tiers": {"A": (0.45, 0.38, 0.20), "B": (0.38, 0.32, 0.30),
+              "C": (0.32, 0.26, 0.30), "D": (0.26, 0.00, 0.15)},
+}
+
+def _slot5_tier(dd):
+    for nm, (hi, lo, w) in SLOT5["tiers"].items():
+        if (lo < dd <= hi) if nm != "D" else (dd <= hi):
+            return nm
+    return None
+
+def _get_btc_history():
+    """CoinGecko full daily history (без ключа). -> (prices_list, current_price)."""
+    u = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+    r = requests.get(u, params={"vs_currency": "usd", "days": "max"}, timeout=40)
+    r.raise_for_status()
+    prices = [p[1] for p in r.json()["prices"]]
+    if len(prices) < 500:
+        raise RuntimeError(f"BTC мало точек: {len(prices)}")
+    return prices, prices[-1]
+
+def _get_mvrv_history():
+    """CoinMetrics community CapMVRVCur (без ключа). -> (mvrv_list, current_mvrv)."""
+    url = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
+    vals, pt = [], None
+    for _ in range(60):
+        p = {"assets": "btc", "metrics": "CapMVRVCur", "start_time": "2014-01-01",
+             "end_time": datetime.now().strftime("%Y-%m-%d"),
+             "page_size": 10000, "frequency": "1d"}
+        if pt:
+            p["next_page_token"] = pt
+        r = requests.get(url, params=p, timeout=40)
+        r.raise_for_status()
+        j = r.json()
+        for row in j.get("data", []):
+            vals.append(float(row["CapMVRVCur"]))
+        pt = j.get("next_page_token")
+        if not pt:
+            break
+    if len(vals) < 500:
+        raise RuntimeError(f"MVRV мало точек: {len(vals)}")
+    return vals, vals[-1]
+
+def _mvrv_z_now(mvrv_list):
+    """Cumulative Z (формула Glassnode, ddof=1) на последней точке = весь список."""
+    m = statistics.fmean(mvrv_list)
+    s = statistics.stdev(mvrv_list)
+    if s == 0:
+        return 0.0
+    return (mvrv_list[-1] - m) / s
+
+def _get_sp_macro_ok():
+    """S&P 20d momentum >= 0 через Stooq CSV (без ключа). -> (bool|None, note)."""
+    try:
+        r = requests.get("https://stooq.com/q/d/l/", params={"s": "^spx", "i": "d"}, timeout=30)
+        r.raise_for_status()
+        rows = [ln.split(",") for ln in r.text.strip().splitlines()[1:] if ln]
+        closes = [float(x[4]) for x in rows if len(x) >= 5 and x[4] not in ("", "N/D")]
+        n = SLOT5["sp_mom_days"]
+        if len(closes) < n + 1:
+            return None, "S&P мало данных"
+        mom = closes[-1] / closes[-1 - n] - 1.0
+        return (mom >= 0), f"S&P 20d mom {mom*100:+.1f}%"
+    except Exception as e:
+        return None, f"S&P недоступен ({type(e).__name__})"
+
+def _get_fng_now():
+    try:
+        j = requests.get("https://api.alternative.me/fng/?limit=1&format=json", timeout=20).json()
+        return int(j["data"][0]["value"])
+    except Exception:
+        return None
+
+def _slot5_ws():
+    """Лист Slot5_Forward (состояние форварда — Railway эфемерный, состояние в Sheets)."""
+    try:
+        creds = Credentials.from_service_account_info(
+            json.loads(GS_JSON),
+            scopes=["https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"])
+        ss = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+        try:
+            ws = ss.worksheet("Slot5_Forward")
+        except gspread.WorksheetNotFound:
+            ws = ss.add_worksheet(title="Slot5_Forward", rows=2000, cols=14)
+            ws.append_row(["Дата", "Цена", "DD%", "MVRV", "Z", "Тир",
+                           "Cheap", "MacroOK", "F&G", "Конфл", "Действие",
+                           "Сумма$", "Заметка"])
+        return ws
+    except Exception as e:
+        logging.error(f"Slot5_Forward лист: {e}")
+        return None
+
+def slot5_forward_check():
+    """Еженедельная бумажная проверка Слота 5. НЕ торгует — логирует + Telegram."""
+    logging.info("Слот5 forward-проверка...")
+    try:
+        prices, price = _get_btc_history()
+        mvrv_list, mvrv = _get_mvrv_history()
+        z = _mvrv_z_now(mvrv_list)
+        ath = max(prices)
+        dd = price / ath
+        tier = _slot5_tier(dd)
+        cheap = mvrv <= SLOT5["mvrv_buy_thr"]
+        macro_ok, macro_note = _get_sp_macro_ok()
+        fng = _get_fng_now()
+
+        # Конфлюэнция: tier активен + cheap + macro_ok + капитуляция (F&G<=20)
+        sigs = [tier is not None, bool(cheap), macro_ok is True]
+        if fng is not None:
+            sigs.append(fng <= SLOT5["fg_capit"])
+        confl = sum(1 for x in sigs if x)
+        avail = len(sigs)
+
+        ws = _slot5_ws()
+        filled = set()
+        if ws is not None:
+            try:
+                for row in ws.get_all_values()[1:]:
+                    if len(row) >= 11 and row[10].startswith("BUY"):
+                        filled.add(row[5])           # тир из колонки Тир
+                    if len(row) >= 11 and row[10].startswith("SELL"):
+                        filled.add(row[10])          # метка SELL-уровня
+            except Exception as e:
+                logging.error(f"Slot5 чтение состояния: {e}")
+
+        # Решение (бумажное)
+        action, amount, note = "WAIT", "", macro_note
+        if tier and tier not in filled and confl >= SLOT5["confluence_min"]:
+            w = SLOT5["tiers"][tier][2]
+            amount = round(SLOT5["capital"] * w)
+            action = f"BUY {tier}"
+            note = f"БУМАЖНЫЙ вход тир {tier} ({w*100:.0f}% депо)"
+        elif z >= SLOT5["z_full"] and "SELL_FULL" not in filled:
+            action, note = "SELL FULL", f"Z {z:.2f} >= {SLOT5['z_full']} — полный выход"
+        elif z >= SLOT5["z_main"] and "SELL_MAIN" not in filled:
+            action, note = "SELL MAIN", f"Z {z:.2f} >= {SLOT5['z_main']} — срез 30%"
+        elif z >= SLOT5["z_start"] and "SELL_START" not in filled:
+            action, note = "SELL START", f"Z {z:.2f} >= {SLOT5['z_start']} — срез 20%"
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        if ws is not None:
+            try:
+                ws.append_row([today, round(price), f"{(dd-1)*100:.1f}",
+                               round(mvrv, 3), round(z, 3), tier or "—",
+                               "да" if cheap else "нет",
+                               "да" if macro_ok else ("нет" if macro_ok is False else "?"),
+                               fng if fng is not None else "—",
+                               f"{confl}/{avail}", action, amount, note])
+            except Exception as e:
+                logging.error(f"Slot5 запись: {e}")
+
+        flag = "🟢" if action.startswith("BUY") else ("🔴" if action.startswith("SELL") else "⚪")
+        msg = (
+            f"{flag} <b>Слот 5 — forward (бумажный)</b>\n"
+            f"📅 {today}\n\n"
+            f"💰 BTC: <b>${round(price):,}</b>  (от ATH {(dd-1)*100:.1f}%)\n"
+            f"📊 MVRV: {mvrv:.2f}  |  MVRV-Z: <b>{z:.2f}</b>\n"
+            f"🎯 Тир: {tier or 'нет (ещё дорого)'}\n"
+            f"🧩 Конфлюэнция: <b>{confl}/{avail}</b> "
+            f"(cheap:{'✓' if cheap else '✗'} macro:{'✓' if macro_ok else '✗'} "
+            f"F&G:{fng if fng is not None else '—'})\n"
+            f"⚖️ Пороги выхода (заморожены): {SLOT5['z_start']}/{SLOT5['z_main']}/{SLOT5['z_full']}\n\n"
+            f"➡️ <b>{action}</b>"
+            + (f"  ${amount:,}" if amount else "") + f"\n{note}\n\n"
+            f"<i>Бумажный форвард. Реальные деньги заблокированы Пунктом 0.</i>"
+        )
+        send_telegram(msg)
+    except Exception as e:
+        logging.error(f"Слот5 forward ошибка: {e}")
+        send_telegram(f"⚠️ Слот5 forward ошибка: {e}")
 
 # ─── SCHEDULER ──────────────────────────────────────────────────────────────
 # replace_existing=True + id предотвращают двойную регистрацию в одном процессе.
