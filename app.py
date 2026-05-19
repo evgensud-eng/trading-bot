@@ -1024,12 +1024,33 @@ def news_digest():
         send_telegram(f"⚠️ Агент News ошибка: {e}")
 
 # ─── SCHEDULER ──────────────────────────────────────────────────────────────
-# replace_existing=True + id предотвращают двойную регистрацию в одном процессе.
-# Если Railway запускает 2 воркера — добавь в start-команду: gunicorn --workers 1 app:app
-scheduler = BackgroundScheduler()
-scheduler.add_job(weekly_report, "cron", day_of_week="mon", hour=9, minute=0,
-                  id="weekly_report", replace_existing=True)
-scheduler.start()
+# replace_existing=True спасает только ВНУТРИ одного процесса. Если воркеров >1,
+# каждый поднимет свой scheduler и job отработает N раз -> дубль строки в
+# Slot5_Forward и дубль тира в filled = грязь в форварде.
+# Решение: межпроцессный файловый лок. Лок берёт ТОЛЬКО первый воркер; он его
+# держит до смерти процесса (НЕ закрываем fd намеренно). Остальные воркеры
+# не получают лок и шедулер не поднимают. Не зависит от --workers вообще.
+import fcntl
+
+_SCHED_LOCK_PATH = os.environ.get("SCHED_LOCK_PATH", "/tmp/algobot_scheduler.lock")
+
+def _start_scheduler_once():
+    try:
+        fd = open(_SCHED_LOCK_PATH, "w")
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        logging.info("Шедулер уже запущен в другом воркере — пропускаю (это норма)")
+        return
+    # fd намеренно не закрываем и держим ссылку — лок жив пока жив процесс.
+    globals()["_SCHED_LOCK_FD"] = fd
+    sch = BackgroundScheduler()
+    sch.add_job(weekly_report, "cron", day_of_week="mon", hour=9, minute=0,
+                id="weekly_report", replace_existing=True)
+    sch.start()
+    logging.info("Шедулер запущен в этом воркере (лок взят)")
+    return sch
+
+scheduler = _start_scheduler_once()
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
