@@ -175,6 +175,8 @@ def weekly_report():
     # Слот 5 forward — бумажный мониторинг. Своя обработка ошибок внутри,
     # запускается всегда после отчёта (даже если отчёт упал).
     slot5_forward_check()
+    # Агент News — дайджест значимых новостей (только если есть важное).
+    news_digest()
 
 # ─── TELEGRAM ───────────────────────────────────────────────────────────────
 def send_telegram(message):
@@ -515,6 +517,12 @@ def slot5_check_route():
     """Ручной запуск forward-проверки Слота 5 (для теста, без денег)."""
     slot5_forward_check()
     return jsonify({"status": "slot5 forward check done"})
+
+@app.route("/news_check", methods=["GET"])
+def news_check_route():
+    """Ручной запуск агента News (для теста)."""
+    news_digest()
+    return jsonify({"status": "news digest checked"})
 
 # ─── ДИАГНОСТИКА BYBIT DATA API (для варианта D) ────────────────────────────
 @app.route("/bybit_check", methods=["GET"])
@@ -910,6 +918,101 @@ def slot5_forward_check():
     except Exception as e:
         logging.error(f"Слот5 forward ошибка: {e}")
         send_telegram(f"⚠️ Слот5 forward ошибка: {e}")
+
+# ─── АГЕНТ NEWS ─────────────────────────────────────────────────────────────
+# Роль: КОНТЕКСТ, не сигнал. Дайджест НЕ основание для сделки (ТЗ раздел 4).
+# Источник: бесплатные RSS (без ключей/квот). Парсинг штатным xml.etree.
+# Фильтр значимости — детерминированный по ключевым словам, НЕ AI.
+# Нет значимых новостей за период -> дайджест НЕ отправляется (тишина=нет важного).
+
+NEWS_FEEDS = {
+    "CoinDesk":      "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "Cointelegraph": "https://cointelegraph.com/rss",
+    "Investing":     "https://www.investing.com/rss/news_25.rss",
+    "CNBC Econ":     "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258",
+}
+
+# Триггеры значимости (правь под себя). Регистронезависимо.
+NEWS_TRIGGERS = [
+    "etf", "halving", "sec ", "lawsuit", "rate cut", "rate hike", "fed ",
+    "fomc", "inflation", "cpi", "recession", "war", "sanction", "hack",
+    "exploit", "regulation", "ban ", "approv", "crash", "liquidation",
+    "bankrupt", "default", "tariff", "blackrock", "microstrategy",
+    "interest rate", "powell", "treasury", "etf inflow", "etf outflow",
+]
+
+def _parse_rss(url, limit=15):
+    """RSS -> [(title, link)]. Штатный xml.etree, без зависимостей."""
+    import xml.etree.ElementTree as ET
+    r = requests.get(url, timeout=10,
+                      headers={"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"})
+    r.raise_for_status()
+    root = ET.fromstring(r.content)
+    items = []
+    for it in root.iter("item"):
+        t = (it.findtext("title") or "").strip()
+        l = (it.findtext("link") or "").strip()
+        if t:
+            items.append((t, l))
+        if len(items) >= limit:
+            break
+    return items
+
+def news_digest():
+    """Значимые новости из RSS. Шлёт дайджест ТОЛЬКО если есть важное."""
+    logging.info("Агент News: сбор...")
+    try:
+        hits = []
+        for name, url in NEWS_FEEDS.items():
+            try:
+                for title, link in _parse_rss(url):
+                    low = title.lower()
+                    m = [kw.strip() for kw in NEWS_TRIGGERS if kw in low]
+                    if m:
+                        hits.append((name, title, link, m[0]))
+            except Exception as e:
+                logging.warning(f"News {name} fail: {type(e).__name__}: {str(e)[:80]}")
+                continue
+
+        if not hits:
+            logging.info("Агент News: значимого нет — дайджест не отправлен")
+            return
+
+        seen, uniq = set(), []
+        for h in hits:
+            k = h[1][:80].lower()
+            if k not in seen:
+                seen.add(k)
+                uniq.append(h)
+        uniq = uniq[:12]
+
+        lines = [f"📰 <b>News дайджест</b> ({datetime.now().strftime('%Y-%m-%d')})",
+                 f"Значимых: <b>{len(uniq)}</b>\n"]
+        for name, title, link, kw in uniq:
+            safe = title.replace("<", "‹").replace(">", "›").replace("&", "&amp;")
+            lines.append(f"• [{name}] {safe}\n  🔑<i>{kw}</i>")
+        lines.append("\n⚠️ КОНТЕКСТ, не сигнал. НЕ основание для сделки.")
+        send_telegram("\n".join(lines))
+
+        try:
+            creds = Credentials.from_service_account_info(
+                json.loads(GS_JSON),
+                scopes=["https://www.googleapis.com/auth/spreadsheets",
+                        "https://www.googleapis.com/auth/drive"])
+            ss = gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+            try:
+                nws = ss.worksheet("News")
+            except gspread.WorksheetNotFound:
+                nws = ss.add_worksheet(title="News", rows=2000, cols=5)
+                nws.append_row(["Дата", "Источник", "Заголовок", "Триггер", "Ссылка"])
+            today = datetime.now().strftime("%Y-%m-%d")
+            for name, title, link, kw in uniq:
+                nws.append_row([today, name, title[:300], kw, link[:300]])
+        except Exception as e:
+            logging.warning(f"News Sheets log fail (не критично): {type(e).__name__}")
+    except Exception as e:
+        logging.error(f"Агент News ошибка: {e}")
+        send_telegram(f"⚠️ Агент News ошибка: {e}")
 
 # ─── SCHEDULER ──────────────────────────────────────────────────────────────
 # replace_existing=True + id предотвращают двойную регистрацию в одном процессе.
