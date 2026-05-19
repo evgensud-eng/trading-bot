@@ -934,11 +934,12 @@ NEWS_FEEDS = {
 
 # Триггеры значимости (правь под себя). Регистронезависимо.
 NEWS_TRIGGERS = [
-    "etf", "halving", "sec ", "lawsuit", "rate cut", "rate hike", "fed ",
-    "fomc", "inflation", "cpi", "recession", "war", "sanction", "hack",
-    "exploit", "regulation", "ban ", "approv", "crash", "liquidation",
-    "bankrupt", "default", "tariff", "blackrock", "microstrategy",
-    "interest rate", "powell", "treasury", "etf inflow", "etf outflow",
+    "etf", "halving", "sec", "lawsuit", "rate cut", "rate hike", "fed",
+    "fomc", "inflation", "cpi", "recession", "war", "sanctions", "hack",
+    "exploit", "regulation", "regulator", "ban", "approve", "approval",
+    "crash", "liquidation", "bankrupt", "bankruptcy", "default", "tariff",
+    "blackrock", "microstrategy", "interest rate", "interest rates",
+    "powell", "treasury", "etf inflow", "etf outflow", "halt", "default",
 ]
 
 def _parse_rss(url, limit=15):
@@ -967,7 +968,15 @@ def news_digest():
             try:
                 for title, link in _parse_rss(url):
                     low = title.lower()
-                    m = [kw.strip() for kw in NEWS_TRIGGERS if kw in low]
+                    # Поиск по ГРАНИЦАМ СЛОВА: 'war' не ловит 'Warby/Warren',
+                    # 'etf' не ловит 'Netflix'. Многословные триггеры — как есть.
+                    m = []
+                    for kw in NEWS_TRIGGERS:
+                        if " " in kw:
+                            if kw in low:
+                                m.append(kw)
+                        elif re.search(r"\b" + re.escape(kw) + r"\b", low):
+                            m.append(kw)
                     if m:
                         hits.append((name, title, link, m[0]))
             except Exception as e:
