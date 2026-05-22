@@ -47,16 +47,15 @@ STRATEGY_CONFIGS = {
         "uses_tp_rr": False,
         "uses_rsi": False
     },
-    # Слот X (ETH) — OUT-OF-SYMBOL validation of BTC Donchian v1.1.
+    # Слот X (ETH) — OUT-OF-SYMBOL validation BTC Donchian v1.1.
     # Параметры заморожены, sizing 0.3-0.5x BTC (решение консилиума 21.05.2026).
     # PASS: PF 14.22, WR 68.8%, MaxDD -22.9%, profit_years 6/6 = 100%.
-    # Council 4 AI 4/4 GO для форвард тест-депо. Реальные деньги — Фаза C.
     "donchian_eth": {
         "name": "Donchian ETH",
-        "description": "Donchian Channel Breakout on ETH/USDT Daily. Frozen BTC v1.1 params (entry=40, exit=30, SMA200 ON). OUT-OF-SYMBOL validation, NOT optimized per coin.",
+        "description": "Donchian Channel Breakout on ETH/USDT Daily. Frozen BTC v1.1 params. OUT-OF-SYMBOL validation, NOT optimized per coin.",
         "tf": "1D",
         "type": "trend_following",
-        "ai_rules": "BUY if entry confirmed by Daily close above 40d high AND above SMA200 (trend OK) AND stop distance < 15% from entry. This is trend-following on ETH — high RSI is NORMAL (don't reject for overbought). High BTC-ETH correlation: if BTC v1.1 already in position, sizing rec is 0.3-0.5x. Reject only if stop unreasonably far or trend filter failed. Otherwise SKIP.",
+        "ai_rules": "BUY if entry confirmed by Daily close above 40d high AND above SMA200 AND stop distance < 15% from entry. Trend-following on ETH — high RSI is NORMAL. BTC-ETH correlation high: sizing rec is 0.3-0.5x BTC. Reject only if stop unreasonably far or trend filter failed. Otherwise SKIP.",
         "uses_consilium": True,
         "uses_tp_rr": False,
         "uses_rsi": False
@@ -546,6 +545,27 @@ def slot5_check_route():
     slot5_forward_check()
     return jsonify({"status": "slot5 forward check done"})
 
+@app.route("/slot5_signal", methods=["POST"])
+def slot5_signal_route():
+    """Pine алерт от Slot 5 (B3). НЕ через консилиум - чистая алгоритмическая
+    стратегия с заморожен ной логикой. Pine детектит вход в зону тира,
+    app.py досчитывает confluence (MVRV+macro+F&G) и решает BUY/WAIT.
+
+    Pine посылает JSON вида:
+        {"strategy":"slot5","trigger":"tier_A_entry","price":52000,"time":"..."}
+    Нам важен сам факт срабатывания - детали считаем сами через slot5_evaluate.
+    """
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        logging.info(f"Slot5 Pine alert: {data}")
+        trigger = data.get("trigger", "unknown")
+        # Игнорируем всё кроме факта срабатывания - своя логика приоритетнее
+        result = slot5_evaluate(source=f"pine:{trigger}")
+        return jsonify({"status": "ok", "trigger": trigger, "result": result})
+    except Exception as e:
+        logging.error(f"Slot5 signal ошибка: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 @app.route("/news_check", methods=["GET"])
 def news_check_route():
     """Ручной запуск агента News (для теста)."""
@@ -868,14 +888,16 @@ def _slot5_ws():
         logging.error(f"Slot5_Forward лист: {e}")
         return None
 
-def slot5_forward_check():
-    """Еженедельная бумажная проверка Слота 5. НЕ торгует — логирует + Telegram."""
-    logging.info("Слот5 forward-проверка...")
+def slot5_evaluate(source="weekly"):
+    """Общая логика Слота 5. Используется и шедулером (source='weekly'),
+    и Pine-алертом (source='pine_alert'). НЕ торгует — логирует + Telegram.
+    Возвращает dict с результатом для роута, чтобы вернуть JSON."""
+    logging.info(f"Слот5 evaluate (source={source})...")
     try:
         price = _get_btc_price()
         mvrv_list, mvrv = _get_mvrv_history()
         z = _mvrv_z_now(mvrv_list)
-        ath = max(SLOT5_ATH, price)   # ATH-константа, растёт если новый максимум
+        ath = max(SLOT5_ATH, price)
         dd = price / ath
         tier = _slot5_tier(dd)
         cheap = mvrv <= SLOT5["mvrv_buy_thr"]
@@ -895,9 +917,9 @@ def slot5_forward_check():
             try:
                 for row in ws.get_all_values()[1:]:
                     if len(row) >= 11 and row[10].startswith("BUY"):
-                        filled.add(row[5])           # тир из колонки Тир
+                        filled.add(row[5])
                     if len(row) >= 11 and row[10].startswith("SELL"):
-                        filled.add(row[10])          # метка SELL-уровня
+                        filled.add(row[10])
             except Exception as e:
                 logging.error(f"Slot5 чтение состояния: {e}")
 
@@ -923,13 +945,15 @@ def slot5_forward_check():
                                "да" if cheap else "нет",
                                "да" if macro_ok else ("нет" if macro_ok is False else "?"),
                                fng if fng is not None else "—",
-                               f"{confl}/{avail}", action, amount, note])
+                               f"{confl}/{avail}", action, amount,
+                               f"[{source}] {note}"])
             except Exception as e:
                 logging.error(f"Slot5 запись: {e}")
 
         flag = "🟢" if action.startswith("BUY") else ("🔴" if action.startswith("SELL") else "⚪")
+        source_label = " · Pine alert" if source == "pine_alert" else ""
         msg = (
-            f"{flag} <b>Слот 5 — forward (бумажный)</b>\n"
+            f"{flag} <b>Слот 5 — forward (бумажный){source_label}</b>\n"
             f"📅 {today}\n\n"
             f"💰 BTC: <b>${round(price):,}</b>  (от ATH {(dd-1)*100:.1f}%)\n"
             f"📊 MVRV: {mvrv:.2f}  |  MVRV-Z: <b>{z:.2f}</b>\n"
@@ -943,9 +967,18 @@ def slot5_forward_check():
             f"<i>Бумажный форвард. Реальные деньги заблокированы Пунктом 0.</i>"
         )
         send_telegram(msg)
+        return {"price": round(price), "dd_pct": round((dd-1)*100, 2),
+                "mvrv": round(mvrv, 3), "z": round(z, 3), "tier": tier,
+                "confluence": f"{confl}/{avail}", "action": action,
+                "amount": amount, "source": source}
     except Exception as e:
-        logging.error(f"Слот5 forward ошибка: {e}")
-        send_telegram(f"⚠️ Слот5 forward ошибка: {e}")
+        logging.error(f"Слот5 evaluate ошибка: {e}")
+        send_telegram(f"⚠️ Слот5 ({source}) ошибка: {e}")
+        return {"error": str(e), "source": source}
+
+def slot5_forward_check():
+    """Wrapper для шедулера (еженедельный по понедельникам)."""
+    slot5_evaluate(source="weekly")
 
 # ─── АГЕНТ NEWS ─────────────────────────────────────────────────────────────
 # Роль: КОНТЕКСТ, не сигнал. Дайджест НЕ основание для сделки (ТЗ раздел 4).
