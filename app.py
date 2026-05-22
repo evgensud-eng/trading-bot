@@ -46,6 +46,20 @@ STRATEGY_CONFIGS = {
         "uses_consilium": True,
         "uses_tp_rr": False,
         "uses_rsi": False
+    },
+    # Слот X (ETH) — OUT-OF-SYMBOL validation of BTC Donchian v1.1.
+    # Параметры заморожены, sizing 0.3-0.5x BTC (решение консилиума 21.05.2026).
+    # PASS: PF 14.22, WR 68.8%, MaxDD -22.9%, profit_years 6/6 = 100%.
+    # Council 4 AI 4/4 GO для форвард тест-депо. Реальные деньги — Фаза C.
+    "donchian_eth": {
+        "name": "Donchian ETH",
+        "description": "Donchian Channel Breakout on ETH/USDT Daily. Frozen BTC v1.1 params (entry=40, exit=30, SMA200 ON). OUT-OF-SYMBOL validation, NOT optimized per coin.",
+        "tf": "1D",
+        "type": "trend_following",
+        "ai_rules": "BUY if entry confirmed by Daily close above 40d high AND above SMA200 (trend OK) AND stop distance < 15% from entry. This is trend-following on ETH — high RSI is NORMAL (don't reject for overbought). High BTC-ETH correlation: if BTC v1.1 already in position, sizing rec is 0.3-0.5x. Reject only if stop unreasonably far or trend filter failed. Otherwise SKIP.",
+        "uses_consilium": True,
+        "uses_tp_rr": False,
+        "uses_rsi": False
     }
 }
 
@@ -499,6 +513,20 @@ def test_donchian():
     decision, buy_count, total, votes = run_council(signal)
     return jsonify({
         "status": "donchian test fired", "decision": decision,
+        "votes": f"{buy_count}/{total}", "details": votes
+    })
+
+@app.route("/test_donchian_eth", methods=["GET"])
+def test_donchian_eth():
+    """Тестовый эндпоинт для Donchian ETH (Слот X) — пинай через браузер."""
+    signal = {
+        "symbol": "ETH", "type": "LONG",
+        "price": 3400, "sl": 3050,
+        "strategy": "donchian_eth"
+    }
+    decision, buy_count, total, votes = run_council(signal)
+    return jsonify({
+        "status": "donchian ETH test fired", "decision": decision,
         "votes": f"{buy_count}/{total}", "details": votes
     })
 
@@ -1024,33 +1052,12 @@ def news_digest():
         send_telegram(f"⚠️ Агент News ошибка: {e}")
 
 # ─── SCHEDULER ──────────────────────────────────────────────────────────────
-# replace_existing=True спасает только ВНУТРИ одного процесса. Если воркеров >1,
-# каждый поднимет свой scheduler и job отработает N раз -> дубль строки в
-# Slot5_Forward и дубль тира в filled = грязь в форварде.
-# Решение: межпроцессный файловый лок. Лок берёт ТОЛЬКО первый воркер; он его
-# держит до смерти процесса (НЕ закрываем fd намеренно). Остальные воркеры
-# не получают лок и шедулер не поднимают. Не зависит от --workers вообще.
-import fcntl
-
-_SCHED_LOCK_PATH = os.environ.get("SCHED_LOCK_PATH", "/tmp/algobot_scheduler.lock")
-
-def _start_scheduler_once():
-    try:
-        fd = open(_SCHED_LOCK_PATH, "w")
-        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (IOError, OSError):
-        logging.info("Шедулер уже запущен в другом воркере — пропускаю (это норма)")
-        return
-    # fd намеренно не закрываем и держим ссылку — лок жив пока жив процесс.
-    globals()["_SCHED_LOCK_FD"] = fd
-    sch = BackgroundScheduler()
-    sch.add_job(weekly_report, "cron", day_of_week="mon", hour=9, minute=0,
-                id="weekly_report", replace_existing=True)
-    sch.start()
-    logging.info("Шедулер запущен в этом воркере (лок взят)")
-    return sch
-
-scheduler = _start_scheduler_once()
+# replace_existing=True + id предотвращают двойную регистрацию в одном процессе.
+# Если Railway запускает 2 воркера — добавь в start-команду: gunicorn --workers 1 app:app
+scheduler = BackgroundScheduler()
+scheduler.add_job(weekly_report, "cron", day_of_week="mon", hour=9, minute=0,
+                  id="weekly_report", replace_existing=True)
+scheduler.start()
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
