@@ -545,6 +545,13 @@ def slot5_check_route():
     slot5_forward_check()
     return jsonify({"status": "slot5 forward check done"})
 
+@app.route("/test_slot5_signal", methods=["GET"])
+def test_slot5_signal_route():
+    """Тестовый GET — открыть в браузере для ручной проверки. Вызывает
+    slot5_evaluate("manual_test") - тот же путь что Pine webhook."""
+    result = slot5_evaluate(source="manual_test")
+    return jsonify({"status": "ok", "trigger": "manual_test", "result": result})
+
 @app.route("/slot5_signal", methods=["POST"])
 def slot5_signal_route():
     """Pine алерт от Slot 5 (B3). НЕ через консилиум - чистая алгоритмическая
