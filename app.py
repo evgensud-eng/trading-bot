@@ -1097,6 +1097,13 @@ def news_digest():
 scheduler = BackgroundScheduler()
 scheduler.add_job(weekly_report, "cron", day_of_week="mon", hour=9, minute=0,
                   id="weekly_report", replace_existing=True)
+
+# Нативный дневной Donchian BTC/ETH (заменяет TV-вебхук-путь; execution-path, §7.10).
+# log_forward_trade в этом app.py нет → forward_trade_fn опускаем; EXIT всё равно
+# идёт через run_council → Telegram + Sheets, как webhook-путь.
+from donchian_native import register
+register(scheduler, run_council, telegram_fn=send_telegram)
+
 scheduler.start()
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
